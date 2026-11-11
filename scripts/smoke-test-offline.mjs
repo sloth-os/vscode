@@ -93,6 +93,22 @@ try {
 	await page.waitForSelector('.monaco-workbench', { timeout: 120_000 });
 	const title = await page.title();
 	console.log(`[offline] OFFLINE title: ${title}`);
+	// Guard against recursive workbenches: the ext-host iframe navigation must
+	// be answered with the iframe document, never with index.html (which would
+	// boot a second full workbench inside itself, spawning its own ext-host
+	// iframe, and so on without bound).
+	await new Promise((r) => setTimeout(r, 10_000));
+	const frames = page.frames().map((f) => {
+		try { return new URL(f.url()).pathname; } catch { return f.url(); }
+	});
+	const counts = frames.reduce((acc, p) => { acc[p] = (acc[p] ?? 0) + 1; return acc; }, {});
+	const dupes = Object.entries(counts).filter(([, n]) => n > 1);
+	if (dupes.length > 0) {
+		console.log(`[offline] FAIL: recursive frames ${JSON.stringify(dupes)}`);
+		await browser.close();
+		process.exit(1);
+	}
+	console.log(`[offline] frame paths: ${JSON.stringify(counts)}`);
 	await page.screenshot({ path: '/tmp/smoke-offline.png' });
 	console.log('[offline] PASS: workbench boots from the service worker cache with no network');
 	await browser.close();

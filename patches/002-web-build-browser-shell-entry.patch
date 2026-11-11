@@ -22,9 +22,7 @@ diff --git a/build/next/index.ts b/build/next/index.ts
 index dd534bff120..2f475668346 100644
 --- a/build/next/index.ts
 +++ b/build/next/index.ts
-@@ -125,6 +125,12 @@ const codeEntryPoints = [
- const sessionsWebEntryPoint = 'vs/sessions/sessions.web.main.internal';
- const webOnlyEntryPoints = [
+@@ -127,2 +127,8 @@ const webOnlyEntryPoints = [
  	sessionsWebEntryPoint,
 +	// Static-deployment patch: the vscode-web package's workbench.html loads
 +	// out/vs/code/browser/workbench/workbench.js (the browser shell that reads
@@ -33,16 +31,10 @@ index dd534bff120..2f475668346 100644
 +	// too, so the packaged template actually has the file it references.
 +	'vs/code/browser/workbench/workbench',
  ];
- 
- const keyboardMapEntryPoints = [
-@@ -205,6 +211,10 @@ function getCssBundleEntryPointsForTarget(target: BuildTarget): Set<string> {
- 			return new Set([
- 				'vs/workbench/workbench.web.main.internal',
+@@ -207,2 +213,6 @@ function getCssBundleEntryPointsForTarget(target: BuildTarget): Set<string> {
  				'vs/sessions/sessions.web.main.internal',
 +				// Static-deployment patch: bundle the shell's CSS to
 +				// out/vs/code/browser/workbench/workbench.css, which the packaged
 +				// workbench.html references.
 +				'vs/code/browser/workbench/workbench',
  			]);
- 		case 'mobile':
- 			return new Set([mobileEntryPoint]);

@@ -3,9 +3,19 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+  schedule:
+    # Weekly rebuild of a moving upstream main. Five-field POSIX cron in UTC;
+    # the `@weekly` shorthand is NOT supported by Actions. Minute 23, not :00 —
+    # scheduled runs queued at the top of the hour are delayed and can be
+    # dropped under heavy load. Runs from this file on the default branch
+    # against its latest commit, so both checkouts below resolve exactly as
+    # they do on `push` (GITHUB_SHA/GITHUB_REF = last commit on / default branch).
+    - cron: '23 4 * * 1'
   workflow_dispatch:
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages.
+# Jobs that need more (deploy: contents write for the weekly keep-alive
+# commit; alert: issues write) declare it job-locally.
 permissions:
   contents: read
   pages: write
@@ -25,10 +35,21 @@ env:
   # With the checkout at <workspace>/vscode, the package lands at
   # <workspace>/vscode-web — the site root.
   SITE_DIR: vscode-web
+  # Absolute sub-path the site is served from (GitHub Pages project site:
+  # /<repo>). Used by prepare-static.mjs and the site checks.
+  BASE_PATH: /vscode
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # Observed cold run: install 3m46s + gulp ~3m42s, whole job ~8m15s.
+    # Without this, a hung install burns the 360-minute default.
+    timeout-minutes: 120
+    outputs:
+      # Which microsoft/vscode commit this site was built from. The deploy job
+      # writes it into the weekly keep-alive commit, so the version actually
+      # live on Pages is traceable from this repo's history.
+      vscode-sha: ${{ steps.upstream-version.outputs.short }}
     steps:
       - name: Checkout vscode (source)
         uses: actions/checkout@v4
@@ -40,40 +61,146 @@ jobs:
           # history, and submodules aren't used by the web build.
           fetch-depth: 1
 
+      - name: Record upstream version
+        id: upstream-version
+        run: |
+          sha=$(git -C vscode rev-parse HEAD)
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "Building microsoft/vscode@${sha:0:12} ($(git -C vscode log -1 --date=short --format=%cd))"
+
       - name: Checkout publishing repo (this repo, for patches/scripts)
         uses: actions/checkout@v4
         with:
           path: publish
 
+      - name: Apply patches
+        # Runs before toolchain setup on purpose: patch drift is the likeliest
+        # weekly failure, and finding out in seconds beats finding out after
+        # apt + pnpm + node setup.
+        run: |
+          set -euo pipefail
+          cd vscode
+          UPSTREAM_SHA=$(git rev-parse HEAD)
+          echo "upstream microsoft/vscode: \`${UPSTREAM_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # git-apply(1): --3way can only fall back to a 3-way merge "if the patch
+          # records the identity of blobs it is supposed to apply to and we have
+          # those blobs available locally". With fetch-depth: 1 we do not, and
+          # fetching all of microsoft/vscode history every week is not worth it
+          # (91 MB / ~90 s shallow vs. multi-GiB for full history). Instead we
+          # carry the pristine pre-image of each patched file under
+          # patches/base/ (~72 KB) and write it into the object store: blob SHAs
+          # are content-derived, so this recreates exactly the blob named by each
+          # patch's `index <old>..<new>` line. patches/BASE_SHA records the
+          # upstream commit the pre-images were captured at.
+          if [ -d ../publish/patches/base ]; then
+            (cd ../publish/patches/base && find . -type f | sed 's|^\./||') \
+            | while IFS= read -r f; do
+                git hash-object -w "../publish/patches/base/$f" > /dev/null
+              done
+          fi
+
+          for patch in ../publish/patches/*.patch; do
+            echo "Applying $patch"
+            # --3way implies --index and is incompatible with --reject. It still
+            # attempts a direct apply first, so the happy path is unchanged; on
+            # benign upstream context drift it merges automatically, and on a
+            # genuine conflict it exits non-zero and fails the step loudly.
+            # Do NOT pre-flight with a bare `git apply --check`: that has no
+            # 3-way fallback, so it would abort on exactly the drift --3way can
+            # fix.
+            if ! git apply --verbose --3way "$patch"; then
+              echo "::error file=${patch}::does not apply to microsoft/vscode@${UPSTREAM_SHA}, not even by 3-way merge - regenerate the patch and refresh patches/base/"
+              {
+                echo "### Apply patches failed"
+                echo
+                echo "\`${patch}\` does not apply to microsoft/vscode@\`${UPSTREAM_SHA}\`, not even by 3-way merge."
+                echo
+                echo "Regenerate it against current main (\`git diff -U1\` for patch 002 — minimal context maximizes the range of commits an exact apply spans; \`-U3\` elsewhere — more context makes plain \`git apply\` strictly more brittle, do NOT use -U20), then refresh the pre-images from the same commit so \`--3way\` keeps working:"
+                echo
+                echo '```bash'
+                echo "cd vscode   # at ${UPSTREAM_SHA}"
+                echo "# ...re-apply your change by hand, then:"
+                echo "git diff -U3 > ../publish/patches/NNN-name.patch"
+                echo "for f in build/next/index.ts src/vs/workbench/workbench.web.main.ts; do"
+                echo "  mkdir -p ../publish/patches/base/\$(dirname \$f)"
+                echo "  git show ${UPSTREAM_SHA}:\$f > ../publish/patches/base/\$f"
+                echo "done"
+                echo "echo ${UPSTREAM_SHA} > ../publish/patches/BASE_SHA"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+
       - name: Setup build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            g++-14 \
-            pkg-config \
-            libx11-dev \
-            libxkbfile-dev \
-            libsecret-1-dev \
-            libkrb5-dev \
-            libglib2.0-dev \
-            libdrm-dev \
-            libgbm-dev \
-            libasound2-dev \
-            rpm
+          # The Ubuntu archive is occasionally unreachable from the hosted runners.
+          # microsoft/vscode wraps every apt-get call in a retry for this reason
+          # (build/azure-pipelines/linux/apt-install-with-retry.sh, and
+          # build/azure-pipelines/web/product-build-web.yml for this same target).
+          # Retry inline rather than calling that script: apt-retry.sh never
+          # propagates the wrapped command's exit status, and its path lives in a
+          # tree that moves every week.
+          #
+          # Acquire::Retries makes apt itself retry each failed file inside one
+          # run; Acquire::http::Timeout stops a stalled connection burning apt's
+          # default 120s per file. (apt's default Retries is 0.)
+          sudo sh -c 'printf "%s\n" "Acquire::Retries \"5\";" "Acquire::http::Timeout \"15\";" > /etc/apt/apt.conf.d/80-vscode-retry'
+
+          # Retry update+install as a whole, and FAIL the step if every attempt
+          # fails. Note the explicit `exit 1`: under the runner's default
+          # `bash -e {0}`, a loop body ending in `sleep` returns 0, so a naive
+          # `... && break || sleep 10` loop would go green with no packages
+          # installed and the build would die later inside node-gyp.
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+              build-essential \
+              g++-14 \
+              pkg-config \
+              libx11-dev \
+              libxkbfile-dev \
+              libsecret-1-dev \
+              libkrb5-dev \
+              libglib2.0-dev \
+              libdrm-dev \
+              libgbm-dev \
+              libasound2-dev \
+              rpm
+            then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "apt-get failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "apt-get failed (attempt $attempt/3); retrying in 30s" >&2
+            sleep 30
+          done
 
       - name: Setup pnpm
         # Must run before setup-node so the latter can query the pnpm store
-        # path for caching. Version matches the vscode checkout's
-        # packageManager field (pnpm@12.16.0).
-        uses: pnpm/action-setup@v4
+        # path for caching. No `version:` input — v6 reads the pin from the
+        # vscode checkout's packageManager field (path is relative to
+        # GITHUB_WORKSPACE), so it can never drift from upstream main
+        # (build/npm/preinstall.ts hard-fails the install when the running
+        # pnpm is not the pinned one). Mirrors vscode's own
+        # .github/actions/setup-pnpm/action.yml.
+        uses: pnpm/action-setup@v6.1.1
         with:
-          version: 12.16.0
+          package_json_file: vscode/package.json
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24.22.1
+          # Follow the checked-out vscode's .nvmrc — the single source of truth.
+          # build/npm/preinstall.ts hard-fails `pnpm install` if the running
+          # Node differs in major from, or is older than, .nvmrc, and upstream
+          # bumps it ~monthly (5 times in the last 6 months, incl. a 22 -> 24
+          # major jump), so any literal pin here becomes a scheduled-build
+          # outage. Relative paths resolve against GITHUB_WORKSPACE, the parent
+          # of both path:-scoped checkouts.
+          node-version-file: vscode/.nvmrc
           # Cache pnpm store for the vscode checkout (its pnpm-lock.yaml)
           cache: pnpm
           cache-dependency-path: vscode/pnpm-lock.yaml
@@ -83,20 +210,72 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Apply patches
-        run: |
-          cd vscode
-          for patch in ../publish/patches/*.patch; do
-            echo "Applying $patch"
-            git apply --verbose "$patch"
-          done
-
       - name: Install dependencies
+        # 5 attempts x 600s = 50m worst case, inside the 55m step budget.
+        timeout-minutes: 55
         run: |
           cd vscode
-          pnpm install --frozen-lockfile
+          # Mirror upstream build/azure-pipelines/web/product-build-web.yml:
+          # retry transient registry/CDN failures AND cap each attempt with
+          # `timeout`, because the documented failure mode is a HANG "inside
+          # the nested postinstall installs", which a bare retry cannot
+          # recover from. `cmd && break` is exempt from `bash -e`, so the loop
+          # is safe under the runner's default shell.
+          for i in {1..5}; do
+            timeout 600 pnpm install --frozen-lockfile && break
+            if [ $i -eq 5 ]; then
+              echo "pnpm install failed/hung too many times" >&2
+              exit 1
+            fi
+            echo "pnpm install attempt $i failed or timed out, retrying..."
+          done
+        env:
+          # The web build bundles no Electron and no browser. playwright-core's
+          # installBrowsersForNpmInstall() and ensureConfiguredBrowserInstalled()
+          # both early-return on PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD, skipping
+          # ~291 MiB from cdn.playwright.dev (Chrome for Testing + Headless
+          # Shell + FFmpeg) on every run, since ~/.cache/ms-playwright is not
+          # covered by setup-node's `cache: pnpm`. Verified unused: no
+          # playwright reference in build/gulpfile.vscode.web.ts,
+          # build/lib/extensions.ts, build/lib/esbuild.ts, build/lib/compilation.ts,
+          # remote/web/package.json, or the built vscode-web package; the site
+          # checks are pure shell + node.
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          # Parity with upstream / future-proofing. Currently a no-op at
+          # electron 42.10.0, which ships no lifecycle scripts (electron's
+          # package.json has no `scripts` key), so no Electron binary is
+          # downloaded by install anyway.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          # @vscode/ripgrep's postinstall sends this as `authorization: token ...`
+          # to api.github.com (lib/download.js). Without it the release-asset
+          # call is unauthenticated and shares the hosted runner's 60 req/h IP
+          # limit. `permissions: contents: read` above already exposes it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Type-check patched workbench (drift guard)
+        timeout-minutes: 15
+        run: |
+          cd vscode
+          # The vscode-web-min chain is esbuild-only (build/next/transpile.ts,
+          # build/next/bundle.ts): esbuild validates named *imports* but never
+          # types, so an upstream method rename or reshaped options object
+          # consumed by patches/001 still bundles and ships a silently dead
+          # contribution (contributions.ts swallows ctor errors into
+          # logService.error). Run upstream's own native TS typecheck over
+          # src/ — the same compiler/project build/lib/tsgo.ts drives in
+          # upstream CI. ~35s, ~6.3GB RSS; fits the 4 vCPU / 16 GB
+          # ubuntu-24.04 runner. Upstream main is green here by its own CI, so
+          # a failure points at our patch. Verified: renaming
+          # HTMLFileSystemProvider.registerFileHandle yields
+          # webPwaFileHandling.ts(161,35): error TS2339.
+          node node_modules/@typescript/native/bin/tsc \
+            --project src/tsconfig.json \
+            --noEmit \
+            --pretty false \
+          || { echo "::error::src typecheck failed - patches/001 likely drifted from upstream main"; exit 1; }
 
       - name: Build vscode-web package
+        timeout-minutes: 45
         run: |
           cd vscode
           # package.json "gulp" script: node --experimental-strip-types \
@@ -106,29 +285,12 @@ jobs:
       - name: Prepare static site
         run: |
           node publish/scripts/prepare-static.mjs \
-            --base /vscode \
+            --base ${{ env.BASE_PATH }} \
             --vscode-root vscode \
             ${{ env.SITE_DIR }}
 
       - name: Check site
-        run: |
-          cd ${{ env.SITE_DIR }}
-          # Sanity checks on the generated site
-          test -f index.html
-          test -f callback.html
-          test -f manifest.webmanifest
-          test -f sw.js
-          test -f offline.html
-          test -f out/nls.messages.js
-          test -f out/vs/code/browser/workbench/workbench.js
-          test -f out/vs/code/browser/workbench/workbench.css
-          # No unreplaced placeholders may remain anywhere
-          ! grep -rq '{{WORKBENCH_' index.html
-          # The service worker must have a concrete precache list
-          grep -q 'PRECACHE_URLS = \[' sw.js
-          # No .map files shipped (they bloat the deploy and aren't needed)
-          ! find out extensions -name '*.map' | grep -q .
-          echo "Site check passed"
+        run: bash publish/scripts/check-site.sh "${{ env.SITE_DIR }}" "${{ env.BASE_PATH }}"
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -145,7 +307,144 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-24.04
     needs: build
+    # A job-level `permissions` map replaces the workflow-level one: any scope
+    # not listed here becomes `none`. So pages/id-token must be repeated or
+    # actions/deploy-pages loses its OIDC token and the deploy fails.
+    # `contents: write` is scoped HERE and not to `build`, which runs
+    # `pnpm install` (postinstall = arbitrary dependency code) against moving
+    # upstream main; that job stays read-only.
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Verify deployed site
+        run: |
+          set -euo pipefail
+          # Every other check runs pre-upload; host-side behavior (content
+          # types, CDN propagation, actual reachability of precached URLs) is
+          # exactly what the runner cannot emulate. Probe the live origin and
+          # fail the run — feeding the alert job — if the deployed site is not
+          # what we built.
+          SITE="${{ steps.deployment.outputs.page_url }}"   # e.g. https://sloth-os.github.io/vscode/
+          echo "Verifying live site at $SITE"
+          # The Pages CDN can lag the deploy call by a few seconds; retry each
+          # probe for up to ~2 minutes before failing.
+          probe() { # probe <path-relative-to-site> <expected-substring>
+            local p="$1" want="$2" body=""
+            for attempt in 1 2 3 4 5 6; do
+              body=$(curl -sS --max-time 60 "${SITE}${p}" || true)
+              if [ -n "$body" ] && grep -qF "$want" <<<"$body"; then
+                echo "  ok   ${p:-index.html} contains '${want}'"
+                return 0
+              fi
+              sleep 15
+            done
+            echo "::error::live check failed for ${SITE}${p} (expected content: ${want})"
+            return 1
+          }
+          status_of() { # status_of <path> -> "<code> <content-type>"
+            curl -sS -o /dev/null -w '%{http_code} %{content_type}' --max-time 60 "${SITE}$1" || true
+          }
+          probe "" 'navigator.serviceWorker.register('
+          probe "manifest.webmanifest" 'file_handlers'
+          probe "sw.js" 'PRECACHE_URLS = ['
+          probe "out/vs/code/browser/workbench/workbench.js" 'workbench.contrib.webPwaFileHandling'
+          # The manifest must be served as application/manifest+json or
+          # browsers ignore the install metadata (file_handlers included).
+          read -r code ctype <<<"$(status_of manifest.webmanifest)"
+          if [ "$code" != 200 ] || ! grep -q 'manifest+json' <<<"$ctype"; then
+            echo "::error::manifest.webmanifest served as '${code} ${ctype}', expected 200 application/manifest+json"
+            exit 1
+          fi
+          echo "  ok   manifest.webmanifest served as ${ctype}"
+          # Sample the live precache list against the live origin: entries the
+          # SW will fetch on install must actually be reachable. jq and shuf
+          # are preinstalled on ubuntu-24.04.
+          mapfile -t sample < <(curl -sS --max-time 60 "${SITE}sw.js" \
+            | sed -n 's/^const PRECACHE_URLS = \(.*\);$/\1/p' | jq -r '.[]' | shuf -n 10)
+          if [ "${#sample[@]}" -eq 0 ]; then
+            echo "::error::could not extract PRECACHE_URLS from live sw.js"
+            exit 1
+          fi
+          for u in "${sample[@]}"; do
+            read -r code _ <<<"$(status_of "$u")"
+            if [ "$code" != 200 ]; then
+              echo "::error::precache sample '${u}' returned HTTP ${code}"
+              exit 1
+            fi
+            echo "  ok   precache sample ${u}"
+          done
+          echo "Live site verified"
+
+      - name: Checkout publishing repo (keep-alive)
+        if: github.event_name == 'schedule'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Keep the weekly schedule armed
+        if: github.event_name == 'schedule'
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # GitHub auto-disables scheduled workflows in a public repo after 60
+          # days with no *repository activity*. A workflow run and its Pages
+          # deployment do not count (only pushes/PRs/issues do), so a repo that
+          # only ever builds on a cron silently loses its schedule after two
+          # months and the site freezes with no failure notification. One empty
+          # commit a week keeps it armed and records which upstream commit the
+          # live site was built from. A GITHUB_TOKEN push never starts a new
+          # run, and [skip ci] covers the `on: push` trigger anyway — no loop.
+          git fetch origin main
+          git checkout -B main FETCH_HEAD
+          git commit --allow-empty \
+            -m "chore: weekly build of microsoft/vscode@${{ needs.build.outputs.vscode-sha }} [skip ci]"
+          git push origin main
+
+  alert:
+    name: Alert on failure
+    runs-on: ubuntu-24.04
+    # Job-level failure(): true when any ancestor job failed. A separate job
+    # (rather than an `if: failure()` step in build) also catches deploy-job
+    # failures, and it cannot be skipped by an earlier step's failure.
+    needs: [build, deploy]
+    if: ${{ failure() }}
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update a ci-alert issue
+        env:
+          # Required: gh does NOT auto-authenticate; the docs mandate a
+          # GH_TOKEN env var for every step that uses GitHub CLI. GITHUB_TOKEN
+          # is also not part of the documented default env var set.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # Bootstrap the label. `gh issue create --label X` fails with HTTP 422
+          # when X does not exist in the repo. Creating a label needs only
+          # Issues write, which this job has.
+          gh label create ci-alert --repo "$REPO" --color D93F0B \
+            --description 'Automated alert: a deploy run failed' --force
+
+          # Dedupe: weekly runs must not spam a new issue per failure.
+          existing="$(gh issue list --repo "$REPO" --state open --label ci-alert \
+                        --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" \
+              --body "Still failing: $RUN_URL (trigger: $TRIGGER)"
+          else
+            body="$(printf 'A `Deploy to GitHub Pages` run failed.\n\nMost likely cause: upstream `microsoft/vscode@main` drifted — a patch conflicted during `git apply --3way` (the run log and step summary say which), the patched source failed the type-check drift guard, or a generated-site check failed.\n\nRun: %s\nTrigger: %s\n\nFix: regenerate the failing patch against current upstream main, refresh `patches/base/` + `patches/BASE_SHA`, and push.\n\nNote: opening/closing this issue does not itself count as repository activity for the 60-day scheduled-workflow auto-disable timer; the weekly keep-alive commit covers that, but check Settings > Actions if scheduled runs ever stop appearing.\n' "$RUN_URL" "$TRIGGER")"
+            gh issue create --repo "$REPO" --label ci-alert \
+              --title 'Deploy failed - likely drift against vscode main' \
+              --body "$body"
+          fi

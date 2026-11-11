@@ -106,6 +106,32 @@ function htmlAttributeEncodeValue(value) {
 	});
 }
 
+// --- 0. prune unreachable payloads ------------------------------------------------
+
+async function pruneUnreachable() {
+	// `out/vs/sessions/**` is a separate esbuild entry (the desktop/agents
+	// "Sessions" app). build/gulpfile.vscode.web.ts copies all of
+	// out-vscode-web-min/** verbatim, so it lands in the package even though
+	// this static site only serves index.html -> out/vs/code/browser/workbench/
+	// workbench.js and the package contains no sessions HTML entry (upstream's
+	// only ones are src/vs/sessions/electron-browser/*.html). It is ~44 MiB of
+	// artifact and precache that no client can ever request. Drop it — but only
+	// while nothing references it, so a future upstream wiring is a logged
+	// warning rather than a silent break.
+	const entry = path.join(BUILD_DIR, 'out/vs/code/browser/workbench/workbench.js');
+	const target = path.join(BUILD_DIR, 'out/vs/sessions');
+	if (!(await exists(target))) {
+		return;
+	}
+	const bundle = (await exists(entry)) ? await fs.readFile(entry, 'utf8') : '';
+	if (bundle.includes('vs/sessions/')) {
+		console.warn('[static] workbench.js references vs/sessions/ — keeping out/vs/sessions');
+		return;
+	}
+	await fs.rm(target, { recursive: true, force: true });
+	console.log('[static] pruned unreachable out/vs/sessions (~44 MiB)');
+}
+
 // --- 1. index.html --------------------------------------------------------------
 
 async function renderIndex() {
@@ -164,7 +190,13 @@ async function renderIndex() {
 \t\t}
 \t</script>`;
 
-	html = html.replace('<body aria-label="">', `<body aria-label="">\n${swRegistration}`);
+	// Inject after whatever the <body> tag currently looks like (attributes may
+	// drift upstream); THROW if the tag is gone so the site never silently
+	// loses offline support and PWA installability.
+	html = html.replace(/<body[^>]*>/, (m) => `${m}\n${swRegistration}`);
+	if (!html.includes('navigator.serviceWorker.register(')) {
+		throw new Error('workbench.html has no <body> tag — service worker registration was NOT injected (site would lose offline support and PWA installability)');
+	}
 
 	// The package task lays out the server resources flat at the package root
 	// (base: 'resources/server' in gulpfile.vscode.web.ts), but the template
@@ -172,14 +204,25 @@ async function renderIndex() {
 	// matches how the dev server serves them, not the static package. Rewrite
 	// those references to the site root.
 	html = html.replaceAll(`${baseUrl}/resources/server/`, `${baseUrl}/`);
+	// Stronger than checking the baseUrl-prefixed form only: any surviving
+	// /resources/server/ ref (e.g. upstream hardcoded it without the
+	// placeholder) would 404, because the package lays those files flat at
+	// the site root. THROW so the breakage is visible in CI, not on the site.
+	if (html.includes('/resources/server/')) {
+		throw new Error('workbench.html references /resources/server/ in a form the rewrite did not catch — icon/manifest refs would 404 on the static site');
+	}
 
 	// Swap the stock manifest (start_url '/', no file handlers, served with
 	// crossorigin=use-credentials for the server's cookie flow) for the
 	// static-hosting variant written by this script.
-	html = html.replace(
-		/<link rel="manifest" href="[^"]*" crossorigin="use-credentials" \/>/,
-		`<link rel="manifest" href="${baseUrl}/manifest.webmanifest" />`
-	);
+	// Attribute-order/shape tolerant: matches the stock link however upstream
+	// renders its attributes. THROW if there is no manifest link at all —
+	// otherwise the PWA File Handling goal would be silently unmet.
+	const manifestLink = /<link[^>]*rel="manifest"[^>]*>/;
+	if (!manifestLink.test(html)) {
+		throw new Error('workbench.html has no <link rel="manifest"> — manifest swap was NOT applied (PWA install/file handling would be silently unmet)');
+	}
+	html = html.replace(manifestLink, () => `<link rel="manifest" href="${baseUrl}/manifest.webmanifest" />`);
 
 	await fs.writeFile(path.join(BUILD_DIR, 'index.html'), html);
 	console.log('[static] wrote index.html');
@@ -314,17 +357,23 @@ async function writeServiceWorker() {
 	// and in a GitHub Pages repo.
 	//
 	// Strategy:
-	//  - PRECACHE everything under out/ and extensions/ plus the generated
-	//    pages, at install time (individual fetches, not cache.addAll, so a
-	//    single network hiccup doesn't fail the whole install).
+	//  - PRECACHE everything under out/, extensions/ and node_modules/ plus
+	//    the generated pages, at install time. Individual fetches with
+	//    per-URL retries and resume-after-interruption; an install still
+	//    FAILS (throws) if any file cannot be staged, so a half-filled cache
+	//    never activates.
 	//  - The cache NAME is derived from a content hash of the precache, so
 	//    every deploy gets a fresh cache; activate() deletes old ones. This
 	//    is what makes cache-first safe: out/ file URLs are stable across
 	//    builds (not content-hashed), so without a new cache name a new
 	//    deploy would keep serving the previous build's files.
+	//  - Updates never skipWaiting: a deployed SW stays 'waiting' until all
+	//    tabs on the previous one are closed, so long-lived PWA sessions are
+	//    never ripped of their cache mid-week.
 	//  - Navigations are network-first (new deploys picked up promptly),
-	//    falling back to the cached index.html / offline.html.
-	//  - Other same-origin GETs are cache-first.
+	//    falling back to the cached index.html / offline.html — index.html
+	//    only for top-level documents, never for sub-frame navigations.
+	//  - Other same-origin GETs are cache-first (ignoring query strings).
 
 	const urls = new Set();
 
@@ -336,8 +385,20 @@ async function writeServiceWorker() {
 		urls.add(generated);
 	}
 
-	// Everything under out/ and extensions/ (skip source maps)
-	for (const dir of ['out', 'extensions']) {
+	// Everything under out/, extensions/ and node_modules/ (skip source maps).
+	// node_modules/ holds runtime AMD node modules the browser fetches lazily
+	// on first use, never during an idle boot: vscode-oniguruma (release/main.js
+	// + release/onig.wasm) and vscode-textmate for tokenization, jschardet and
+	// @vscode/iconv-lite-umd for encoding detection/decoding of opened files,
+	// @vscode/tree-sitter-wasm, @vscode/vscode-languagedetection, katex, ...
+	// (importAMDNodeModule in src/vs/amdX.ts resolves via nodeModulesPath =
+	// 'vs/../../node_modules' => <site root>/node_modules/; gulpfile.vscode.web.ts
+	// flattens remote/web's production deps into the package). Without precaching
+	// them a cold offline session gets 503 from the SW fetch fallback and cannot
+	// tokenize or decode any file. Note: the bundle also references
+	// vscode-regexp-languagedetection, which is NOT shipped in the package —
+	// walking the directory tolerates that (only existing files are listed).
+	for (const dir of ['out', 'extensions', 'node_modules']) {
 		const abs = path.join(BUILD_DIR, dir);
 		if (!(await exists(abs))) {
 			throw new Error(`Missing ${dir}/ in build output at ${abs}`);
@@ -348,10 +409,69 @@ async function writeServiceWorker() {
 	}
 
 	// Icons and favicon referenced by the page and manifest (flat at the
-	// package root, see writeManifest)
+	// package root, see writeManifest).
+	//
+	// That flat location comes from `base: 'resources/server'` in
+	// build/gulpfile.vscode.web.ts — an upstream assumption this pipeline
+	// re-tests against a moving `main` on every scheduled run. A miss must never
+	// be tolerated silently: index.html and manifest.webmanifest reference these
+	// names either way, and Chromium requires the manifest to declare a 192px
+	// and a 512px icon for the app to be installable, so broken icons mean a
+	// green deploy of a PWA that cannot be installed (and therefore no
+	// file_handlers either). Recover the way callback.html is recovered — from
+	// the package's own resources/server/, then from the source checkout — so a
+	// base: change keeps the site installable, and fail the build only when the
+	// icons are gone from both, which needs a human decision about new names.
+	const iconSourceRoot = VSCODE_ROOT ? path.resolve(VSCODE_ROOT) : path.resolve(BUILD_DIR, '../vscode');
 	for (const extra of ['code-192.png', 'code-512.png', 'favicon.ico']) {
-		if (await exists(path.join(BUILD_DIR, extra))) {
-			urls.add(extra);
+		const dest = path.join(BUILD_DIR, extra);
+		if (!(await exists(dest))) {
+			const candidates = [
+				path.join(BUILD_DIR, 'resources/server', extra),
+				path.join(iconSourceRoot, 'resources/server', extra),
+			];
+			let source = null;
+			for (const candidate of candidates) {
+				if (await exists(candidate)) {
+					source = candidate;
+					break;
+				}
+			}
+			if (!source) {
+				throw new Error(
+					`Missing ${extra} at the package root (${dest}); also not at ${candidates.join(' or ')}. ` +
+					`Expected the flat layout produced by base: 'resources/server' in build/gulpfile.vscode.web.ts; ` +
+					`index.html and manifest.webmanifest reference it, so the PWA would ship with broken icons ` +
+					`and would not be installable.`
+				);
+			}
+			await fs.copyFile(source, dest);
+			console.log(`[static] copied ${extra} from ${source} (package did not lay it out flat)`);
+		}
+		urls.add(extra);
+	}
+
+	// Invariant: every URL the generated manifest advertises must actually be
+	// shipped and precached, so an installed / offline PWA resolves them. This
+	// is derived from the manifest that was written rather than from a second
+	// hardcoded list of icon names, so it keeps holding if the icons change.
+	const writtenManifest = JSON.parse(await fs.readFile(path.join(BUILD_DIR, 'manifest.webmanifest'), 'utf8'));
+	for (const raw of [
+		writtenManifest.start_url,
+		writtenManifest.scope,
+		...(writtenManifest.icons ?? []).map((icon) => icon.src),
+		...(writtenManifest.file_handlers ?? []).map((handler) => handler.action),
+	]) {
+		if (raw === undefined) {
+			continue;
+		}
+		if (!raw.startsWith('./')) {
+			throw new Error(`manifest.webmanifest URL ${JSON.stringify(raw)} must be relative ('./…') so it resolves under any base path`);
+		}
+		// './' is the directory index, i.e. index.html on static hosting.
+		const rel = raw === './' ? 'index.html' : raw.slice(2);
+		if (!urls.has(rel)) {
+			throw new Error(`manifest.webmanifest advertises ${raw}, but ${rel} is missing from the package/precache`);
 		}
 	}
 
@@ -388,10 +508,37 @@ self.addEventListener('install', (event) => {
 			while (cursor < PRECACHE_URLS.length) {
 				const url = PRECACHE_URLS[cursor++];
 				try {
-					const response = await fetch(url, { cache: 'reload' });
-					if (response && response.ok) {
-						await cache.put(url, response);
-					} else {
+					// Resume an interrupted install. An entry already staged
+					// under THIS VERSION can only have come from this same
+					// build (VERSION is a content hash of it), so reuse it
+					// instead of re-fetching. Without this, a client that
+					// cannot pull the whole precache in one sitting restarts
+					// from zero on every visit and never converges on offline
+					// support.
+					if (await cache.match(url)) {
+						continue;
+					}
+					// The Pages CDN can transiently 503/429 under
+					// install-sized bursts; retry each URL a few times with
+					// short backoff before counting it failed. The final
+					// throw below still guarantees the SW never activates
+					// half-cached.
+					let stored = false;
+					for (let attempt = 1; attempt <= 3 && !stored; attempt++) {
+						try {
+							const response = await fetch(url, { cache: 'reload' });
+							if (response && response.ok) {
+								await cache.put(url, response);
+								stored = true;
+							}
+						} catch (e) {
+							// network hiccup — back off and retry
+						}
+						if (!stored && attempt < 3) {
+							await new Promise((r) => setTimeout(r, 500 * attempt));
+						}
+					}
+					if (!stored) {
 						failures++;
 					}
 				} catch (e) {
@@ -403,15 +550,31 @@ self.addEventListener('install', (event) => {
 		if (failures > 0) {
 			throw new Error(\`precache incomplete: \${failures}/\${PRECACHE_URLS.length} files failed\`);
 		}
-		await self.skipWaiting();
+		// NO self.skipWaiting() here on purpose: a new deploy's SW must stay
+		// 'waiting' until every tab on the old SW is closed. Activating
+		// mid-session would run the activate handler below — which deletes
+		// the old VERSION cache — under a live workbench and rip its
+		// lazy-loaded chunks out from under it. PWA windows stay open for
+		// weeks across weekly deploys; the update applies at a clean
+		// navigation boundary instead.
 	})());
 });
 
 self.addEventListener('activate', (event) => {
 	event.waitUntil((async () => {
-		// Delete caches from previous deploys
+		// Delete caches from previous deploys. Safe because activation only
+		// happens once no client on the previous SW remains (install does not
+		// call skipWaiting), so no live page can still depend on the old
+		// VERSION cache.
 		const keys = await caches.keys();
 		await Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k)));
+		// Ask for persistent storage: without it the browser can evict the
+		// entire multi-hundred-MB precache under storage pressure, silently
+		// voiding the offline guarantee.
+		if (navigator.storage && navigator.storage.persist) {
+			const persisted = await navigator.storage.persist();
+			console.log('[sw] persistent storage granted:', persisted);
+		}
 		await self.clients.claim();
 	})());
 });
@@ -436,9 +599,27 @@ self.addEventListener('fetch', (event) => {
 				const fresh = await fetch(request);
 				return fresh;
 			} catch {
-				const cached = await caches.match('index.html');
-				if (cached) {
-					return cached;
+				// Sub-frame document navigations (the extension-host iframe is
+				// loaded as
+				//   out/vs/workbench/services/extensions/worker/
+				//     webWorkerExtensionHostIframe.html?&vscodeWebWorkerExtHostId=<uuid>)
+				// are precached WITHOUT the query string, so an exact match
+				// misses. Retry ignoring the query, otherwise the iframe would
+				// be handed index.html and boot a second full workbench inside
+				// itself, which spawns its own ext-host iframe, and so on
+				// without bound.
+				const same = await caches.match(request, { ignoreSearch: true });
+				if (same) {
+					return same;
+				}
+				// Only the top-level app shell may be answered with index.html.
+				// request.destination is 'document' for top-level navigations
+				// and 'iframe'/'frame'/'object'/'embed' for sub-frame ones.
+				if (request.destination === 'document') {
+					const cached = await caches.match('index.html');
+					if (cached) {
+						return cached;
+					}
 				}
 				const offline = await caches.match('offline.html');
 				if (offline) {
@@ -451,9 +632,10 @@ self.addEventListener('fetch', (event) => {
 	}
 
 	// Static assets: cache-first. Safe because each deploy has its own
-	// content-hashed VERSION cache.
+	// content-hashed VERSION cache. ignoreSearch so a query-suffixed request
+	// for a precached file still hits the precache instead of the network.
 	event.respondWith((async () => {
-		const cached = await caches.match(request);
+		const cached = await caches.match(request, { ignoreSearch: true });
 		if (cached) {
 			return cached;
 		}
@@ -477,6 +659,7 @@ self.addEventListener('fetch', (event) => {
 
 // --- main ---------------------------------------------------------------------------
 
+await pruneUnreachable();
 await renderIndex();
 await writeManifest();
 await writeOfflinePage();
