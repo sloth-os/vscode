@@ -1,0 +1,48 @@
+Add the browser shell entry point to the standalone 'web' build target
+---------------------------------------------------------------------
+
+The vscode-web package's workbench.html template loads
+out/vs/code/browser/workbench/workbench.js — the browser shell that reads
+the vscode-workbench-web-configuration meta tag and boots the workbench —
+but the esbuild-era 'web' target only bundles workbench.web.main.internal
+("web workbench only, no browser shell"). The shell entry moved to the
+'server-web' target (used by the remote server, which serves it from its
+own routes), leaving the packaged template pointing at a file the package
+task never emits. (The pre-esbuild pipeline bundled the shell; the last
+published npm vscode-web package still contains workbench.js.)
+
+This patch adds 'vs/code/browser/workbench/workbench' back to the 'web'
+target entry points and to its CSS bundle set, so the package contains
+workbench.js and workbench.css at the paths the template references.
+
+Required for the static GitHub Pages deployment: without the shell there
+is nothing to consume the web configuration and create the workbench.
+
+diff --git a/build/next/index.ts b/build/next/index.ts
+index 1983fd1461c..4b91b409587 100644
+--- a/build/next/index.ts
++++ b/build/next/index.ts
+@@ -124,6 +124,12 @@ const codeEntryPoints = [
+ const sessionsWebEntryPoint = 'vs/sessions/sessions.web.main.internal';
+ const webOnlyEntryPoints = [
+ 	sessionsWebEntryPoint,
++	// Static-deployment patch: the vscode-web package's workbench.html loads
++	// out/vs/code/browser/workbench/workbench.js (the browser shell that reads
++	// the vscode-workbench-web-configuration meta tag), but the 'web' target
++	// only built the shell-less workbench.web.main.internal. Bundle the shell
++	// too, so the packaged template actually has the file it references.
++	'vs/code/browser/workbench/workbench',
+ ];
+ 
+ const keyboardMapEntryPoints = [
+@@ -198,6 +204,10 @@ function getCssBundleEntryPointsForTarget(target: BuildTarget): Set<string> {
+ 			return new Set([
+ 				'vs/workbench/workbench.web.main.internal',
+ 				'vs/sessions/sessions.web.main.internal',
++				// Static-deployment patch: bundle the shell's CSS to
++				// out/vs/code/browser/workbench/workbench.css, which the packaged
++				// workbench.html references.
++				'vs/code/browser/workbench/workbench',
+ 			]);
+ 		default:
+ 			throw new Error(`Unknown target: ${target}`);

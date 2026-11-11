@@ -33,7 +33,7 @@ jobs:
       - name: Checkout vscode (source)
         uses: actions/checkout@v4
         with:
-          repository: sloth-os/vscode
+          repository: microsoft/vscode
           ref: main
           path: vscode
           # The Pages site content is entirely generated; we don't need

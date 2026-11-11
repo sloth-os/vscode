@@ -166,6 +166,13 @@ async function renderIndex() {
 
 	html = html.replace('<body aria-label="">', `<body aria-label="">\n${swRegistration}`);
 
+	// The package task lays out the server resources flat at the package root
+	// (base: 'resources/server' in gulpfile.vscode.web.ts), but the template
+	// references them at {{WORKBENCH_WEB_BASE_URL}}/resources/server/…, which
+	// matches how the dev server serves them, not the static package. Rewrite
+	// those references to the site root.
+	html = html.replaceAll(`${baseUrl}/resources/server/`, `${baseUrl}/`);
+
 	// Swap the stock manifest (start_url '/', no file handlers, served with
 	// crossorigin=use-credentials for the server's cookie flow) for the
 	// static-hosting variant written by this script.
@@ -213,9 +220,10 @@ async function writeManifest() {
 		background_color: '#1f1f1f',
 		theme_color: '#1f1f1f',
 		icons: [
-			{ src: './resources/server/code-192.png', type: 'image/png', sizes: '192x192', purpose: 'any' },
-			{ src: './resources/server/code-512.png', type: 'image/png', sizes: '512x512', purpose: 'any' },
-			{ src: './resources/server/code-512.png', type: 'image/png', sizes: '512x512', purpose: 'maskable' },
+			// The package task writes the icons flat at the site root.
+			{ src: './code-192.png', type: 'image/png', sizes: '192x192', purpose: 'any' },
+			{ src: './code-512.png', type: 'image/png', sizes: '512x512', purpose: 'any' },
+			{ src: './code-512.png', type: 'image/png', sizes: '512x512', purpose: 'maskable' },
 		],
 		// PWA file handling: let the OS offer Code - OSS in the "Open with"
 		// dialog for these file types. Launches are consumed via
@@ -339,8 +347,9 @@ async function writeServiceWorker() {
 		}
 	}
 
-	// Icons and favicon referenced by the page and manifest
-	for (const extra of ['resources/server/code-192.png', 'resources/server/code-512.png', 'resources/server/favicon.ico']) {
+	// Icons and favicon referenced by the page and manifest (flat at the
+	// package root, see writeManifest)
+	for (const extra of ['code-192.png', 'code-512.png', 'favicon.ico']) {
 		if (await exists(path.join(BUILD_DIR, extra))) {
 			urls.add(extra);
 		}
@@ -366,19 +375,34 @@ const PRECACHE_URLS = ${JSON.stringify(sorted)};
 self.addEventListener('install', (event) => {
 	event.waitUntil((async () => {
 		const cache = await caches.open(VERSION);
-		// Stage files individually (not cache.addAll): a single failed fetch
-		// must not fail the whole install. Missed files are retried by the
-		// next install of a newer VERSION.
-		await Promise.allSettled(PRECACHE_URLS.map(async (url) => {
-			try {
-				const response = await fetch(url, { cache: 'reload' });
-				if (response && response.ok) {
-					await cache.put(url, response);
+		// Stage files with a bounded worker pool (12 concurrent fetches):
+		// firing all ~1400 requests at once stampedes the server and most
+		// fetches fail or stall. A failed fetch FAILS the install (throw) so
+		// the browser retries the install event — this is what makes the
+		// "retried later" promise real. Without it, a partially-filled cache
+		// would activate and never be repaired, because the VERSION only
+		// changes on the next deploy.
+		let cursor = 0;
+		let failures = 0;
+		const worker = async () => {
+			while (cursor < PRECACHE_URLS.length) {
+				const url = PRECACHE_URLS[cursor++];
+				try {
+					const response = await fetch(url, { cache: 'reload' });
+					if (response && response.ok) {
+						await cache.put(url, response);
+					} else {
+						failures++;
+					}
+				} catch (e) {
+					failures++;
 				}
-			} catch (e) {
-				// retried by the next install
 			}
-		}));
+		};
+		await Promise.all(Array.from({ length: Math.min(12, PRECACHE_URLS.length) }, worker));
+		if (failures > 0) {
+			throw new Error(\`precache incomplete: \${failures}/\${PRECACHE_URLS.length} files failed\`);
+		}
 		await self.skipWaiting();
 	})());
 });
