@@ -37,6 +37,13 @@ on every push to `main`, and on `workflow_dispatch`:
    workflows in a public repo after 60 days with no *repository* activity, and a workflow run
    or Pages deployment does not count as activity. Pull before committing locally.
 
+> **Skip-token footgun:** GitHub silently skips *push-triggered* runs whenever the head commit
+> message contains `[skip ci]` (or `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip]`) —
+> that is what makes the keep-alive commit safe, but it also means a push whose message merely
+> *mentions* the token anywhere (even quoting this README) creates **no run at all**: the push
+> is recorded, check-runs stay empty, and nothing appears in the Actions tab. `schedule` and
+> `workflow_dispatch` runs are not affected. When in doubt, dispatch the workflow manually.
+
 Base path: `/vscode` (repo name under `sloth-os.github.io`).
 
 ## Failure alerting
