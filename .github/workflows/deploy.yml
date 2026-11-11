@@ -1,0 +1,151 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment, dropping queued ones.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # vscode build requirements
+  CXX: g++-14
+  GULP_TASK: vscode-web-min
+  # The vscode-web gulp task writes the package to BUILD_ROOT, which is the
+  # PARENT of the vscode checkout (see BUILD_ROOT in build/gulpfile.vscode.web.ts).
+  # With the checkout at <workspace>/vscode, the package lands at
+  # <workspace>/vscode-web — the site root.
+  SITE_DIR: vscode-web
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout vscode (source)
+        uses: actions/checkout@v4
+        with:
+          repository: sloth-os/vscode
+          ref: main
+          path: vscode
+          # The Pages site content is entirely generated; we don't need
+          # history, and submodules aren't used by the web build.
+          fetch-depth: 1
+
+      - name: Checkout publishing repo (this repo, for patches/scripts)
+        uses: actions/checkout@v4
+        with:
+          path: publish
+
+      - name: Setup build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            g++-14 \
+            pkg-config \
+            libx11-dev \
+            libxkbfile-dev \
+            libsecret-1-dev \
+            libkrb5-dev \
+            libglib2.0-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libasound2-dev \
+            rpm
+
+      - name: Setup pnpm
+        # Must run before setup-node so the latter can query the pnpm store
+        # path for caching. Version matches the vscode checkout's
+        # packageManager field (pnpm@12.16.0).
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.16.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          # Cache pnpm store for the vscode checkout (its pnpm-lock.yaml)
+          cache: pnpm
+          cache-dependency-path: vscode/pnpm-lock.yaml
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Apply patches
+        run: |
+          cd vscode
+          for patch in ../publish/patches/*.patch; do
+            echo "Applying $patch"
+            git apply --verbose "$patch"
+          done
+
+      - name: Install dependencies
+        run: |
+          cd vscode
+          pnpm install --frozen-lockfile
+
+      - name: Build vscode-web package
+        run: |
+          cd vscode
+          # package.json "gulp" script: node --experimental-strip-types \
+          #   --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js
+          pnpm run gulp ${{ env.GULP_TASK }}
+
+      - name: Prepare static site
+        run: |
+          node publish/scripts/prepare-static.mjs \
+            --base /vscode \
+            --vscode-root vscode \
+            ${{ env.SITE_DIR }}
+
+      - name: Check site
+        run: |
+          cd ${{ env.SITE_DIR }}
+          # Sanity checks on the generated site
+          test -f index.html
+          test -f callback.html
+          test -f manifest.webmanifest
+          test -f sw.js
+          test -f offline.html
+          test -f out/nls.messages.js
+          test -f out/vs/code/browser/workbench/workbench.js
+          test -f out/vs/code/browser/workbench/workbench.css
+          # No unreplaced placeholders may remain anywhere
+          ! grep -rq '{{WORKBENCH_' index.html
+          # The service worker must have a concrete precache list
+          grep -q 'PRECACHE_URLS = \[' sw.js
+          # No .map files shipped (they bloat the deploy and aren't needed)
+          ! find out extensions -name '*.map' | grep -q .
+          echo "Site check passed"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # Upload the prepared site directory
+          path: ${{ env.SITE_DIR }}
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

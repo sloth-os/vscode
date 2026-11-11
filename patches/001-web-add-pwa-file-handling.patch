@@ -1,0 +1,269 @@
+Add PWA file-handling contribution to the web workbench
+------------------------------------------------------
+
+Registers a workbench contribution that integrates the Web App
+Manifest `file_handlers` launch queue with the editor service:
+
+- Consumes `window.launchQueue` entries launched via the PWA
+  "open file" handler (Chrome/Edge on desktop and Android).
+- Each launched `FileSystemFileHandle` is registered with the
+  browser's `HTMLFileSystemProvider` so it appears as a real
+  `file:`-scheme resource that FileEditorInput can open, edit,
+  and save back to disk.
+- Launched directories open as a workspace folder.
+- In browsers without the File System Access API the file
+  contents are read and opened as an untitled editor.
+- Requests permission to persist the handle so that saving
+  back to the launched file works.
+
+The contribution is registered in `workbench.web.main.ts` so it
+only loads in the web workbench (not on desktop).
+
+Applies with `git apply` (generated via `git diff --no-index
+/dev/null <path>`).
+
+Index: src/vs/workbench/contrib/files/browser/webPwaFileHandling.ts
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/vs/workbench/contrib/files/browser/webPwaFileHandling.ts	2026-11-11 00:00:00.000000000 +0000
+@@ -0,0 +1,236 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { ByteSize } from '../../../../platform/files/common/files.js';
++import { HTMLFileSystemProvider } from '../../../../platform/files/browser/htmlFileSystemProvider.js';
++import { WebFileSystemAccess } from '../../../../platform/files/browser/webFileSystemAccess.js';
++import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
++import { Severity } from '../../../../platform/notification/common/notification.js';
++import { localize } from '../../../../nls.js';
++import { isWeb } from '../../../../base/common/platform.js';
++import { mainWindow } from '../../../../base/browser/window.js';
++import { IWorkbenchContribution, WorkbenchPhase, registerWorkbenchContribution2 } from '../../../common/contributions.js';
++import { ILifecycleService, LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
++import { IEditorService } from '../../../services/editor/common/editorService.js';
++import { IHostService } from '../../../services/host/browser/host.js';
++import { IFileService } from '../../../../platform/files/common/files.js';
++import { ILogService } from '../../../../base/common/log.js';
++import { Schemas } from '../../../../base/common/network.js';
++
++/**
++ * The shape of the WICG Web App Launch Handler API (https://wicg.github.io/web-app-launch/)
++ * as implemented in Chromium. Only present in browsers that support the API.
++ */
++interface ILaunchQueue {
++	setConsumer(consumer: (launchParams: ILaunchParams) => void): void;
++}
++
++interface ILaunchParams {
++	readonly targetURL: string | null;
++	readonly files: ReadonlyArray<FileSystemHandle>;
++}
++
++type LaunchQueueContainer = typeof globalThis & { launchQueue?: ILaunchQueue };
++
++/**
++ * The maximum size of files that are opened via the launch queue without
++ * an extra confirmation. Same limit as drag & drop into the editor.
++ */
++const MAX_FILE_SIZE = 100 * ByteSize.MB;
++
++/**
++ * A workbench contribution that opens files that the operating system
++ * launched into the PWA via the `file_handlers` entries in the web app
++ * manifest.
++ *
++ * File handles are registered with the `HTMLFileSystemProvider` so that
++ * they get a `file:` URI. This means the regular file editor, dirty
++ * tracking, and saving back to the original file on disk all work.
++ */
++export class WebPwaFileHandlingContribution implements IWorkbenchContribution {
++
++	static readonly ID = 'workbench.contrib.webPwaFileHandling';
++
++	constructor(
++		@IEditorService private readonly editorService: IEditorService,
++		@IFileService private readonly fileService: IFileService,
++		@IHostService private readonly hostService: IHostService,
++		@ILifecycleService private readonly lifecycleService: ILifecycleService,
++		@ILogService private readonly logService: ILogService,
++		@IDialogService private readonly dialogService: IDialogService
++	) {
++		if (!isWeb) {
++			return;
++		}
++
++		this.registerLaunchQueueConsumer();
++	}
++
++	private registerLaunchQueueConsumer(): void {
++		const { launchQueue } = mainWindow as LaunchQueueContainer;
++		if (!launchQueue) {
++			return; // browser does not support the launch handler API
++		}
++
++		launchQueue.setConsumer(launchParams => {
++			this.handleLaunch(launchParams);
++		});
++	}
++
++	private async handleLaunch(launchParams: ILaunchParams): Promise<void> {
++		const handles = launchParams.files;
++		if (handles.length === 0) {
++			return;
++		}
++
++		// The launch may happen while the workbench is still starting up
++		// (the browser can launch the PWA cold). Wait for the editor area
++		// to be ready before opening editors.
++		await this.lifecycleService.when(LifecyclePhase.Restored);
++
++		// The first launch into an empty window opens the folder as a
++		// workspace if a directory handle was provided.
++		const directories: FileSystemDirectoryHandle[] = [];
++		const files: FileSystemFileHandle[] = [];
++		for (const handle of handles) {
++			if (WebFileSystemAccess.isFileSystemDirectoryHandle(handle)) {
++				directories.push(handle);
++			} else if (WebFileSystemAccess.isFileSystemFileHandle(handle)) {
++				files.push(handle);
++			}
++		}
++
++		if (files.length === 0 && directories.length === 1) {
++			await this.openDirectory(directories[0]);
++			return;
++		}
++
++		for (const fileHandle of files) {
++			try {
++				await this.openFile(fileHandle);
++			} catch (error) {
++				this.logService.error('webPwaFileHandling#openFile', fileHandle.name, error);
++				this.dialogService.error(localize(
++					'pwaFileOpenError',
++					"Failed to open file \"{0}\" launched into the app.",
++					fileHandle.name
++				));
++			}
++		}
++	}
++
++	private async openFile(handle: FileSystemFileHandle): Promise<void> {
++		const provider = this.fileService.getProvider(Schemas.file);
++		if (!(provider instanceof HTMLFileSystemProvider)) {
++			// No File System Access API: read the contents once and open
++			// them as an untitled editor (same fallback as drag & drop).
++			return this.openFileAsUntitled(handle);
++		}
++
++		// Ask for readwrite permission upfront: the editor will read the
++		// file right away and saving back needs write access anyway.
++		await this.requestPermission(handle, 'readwrite');
++
++		const file = await handle.getFile();
++		if (file.size > MAX_FILE_SIZE) {
++			const { result } = await this.dialogService.prompt({
++				type: Severity.Info,
++				message: localize(
++					'pwaFileLarge',
++					"The file \"{0}\" is large ({1}). Do you want to open it anyway?",
++					file.name,
++					ByteSize.formatSize(file.size)
++				),
++				detail: localize('pwaFileLargeDetail', "Large files can take a significant time to open and increase memory usage."),
++				buttons: [{
++					label: localize({ key: 'pwaFileOpen', comment: ['&& denotes an accelerator'] }, "&&Open"),
++					run: () => true
++				}],
++				cancelButton: true
++			});
++			if (result !== true) {
++				return;
++			}
++		}
++
++		// Register the handle to get a file: URI. From here on, the
++		// workbench treats it like any other file: editors, dirty state
++		// and saving all work through the file service.
++		const resource = await provider.registerFileHandle(handle);
++
++		await this.editorService.openEditor({ resource });
++	}
++
++	private async openDirectory(handle: FileSystemDirectoryHandle): Promise<void> {
++		const provider = this.fileService.getProvider(Schemas.file);
++		if (!(provider instanceof HTMLFileSystemProvider)) {
++			this.dialogService.info(localize(
++				'pwaFolderUnsupported',
++				"Opening a folder requires a browser with the File System Access API (e.g. Chrome or Edge)."
++			));
++			return;
++		}
++
++		await this.requestPermission(handle, 'readwrite');
++
++		const folderUri = await provider.registerDirectoryHandle(handle);
++		await this.hostService.openWindow([{ folderUri }]);
++	}
++
++	private async openFileAsUntitled(handle: FileSystemFileHandle): Promise<void> {
++		const file = await handle.getFile();
++
++		// Skip for very large files because this operation is unbuffered
++		if (file.size > MAX_FILE_SIZE) {
++			this.dialogService.warn(localize(
++				'pwaFileTooLargeUntitled',
++				"File \"{0}\" is too large to open as untitled editor. Please upload it into the file explorer and try again.",
++				file.name
++			));
++			return;
++		}
++
++		const contents = new Uint8Array(await file.arrayBuffer());
++		await this.editorService.openEditor({
++			resource: undefined,
++			contents: new TextDecoder().decode(contents),
++			options: { pinned: true }
++		});
++	}
++
++	private async requestPermission(handle: FileSystemHandle, mode: PermissionState): Promise<void> {
++		try {
++			// `queryPermission` is not in all typings; access through the
++			// runtime object to avoid a compile error when the typings
++			// are older than the runtime.
++			const queryPermission = (handle as unknown as { queryPermission?(descriptor: { mode: string }): Promise<PermissionState> }).queryPermission;
++			const requestPermission = (handle as unknown as { requestPermission?(descriptor: { mode: string }): Promise<PermissionState> }).requestPermission;
++			if (queryPermission && requestPermission) {
++				const state = await queryPermission.call(handle, { mode: mode });
++				if (state !== 'granted') {
++					await requestPermission.call(handle, { mode: mode });
++					// A rejection does not throw; subsequent reads will
++					// surface an error if access was denied.
++				}
++			}
++		} catch (error) {
++			this.logService.warn('webPwaFileHandling#requestPermission', error);
++		}
++	}
++}
++
++registerWorkbenchContribution2(
++	WebPwaFileHandlingContribution.ID,
++	WebPwaFileHandlingContribution,
++	WorkbenchPhase.BlockRestore
++);
+Index: src/vs/workbench/workbench.web.main.ts
+===================================================================
+--- src/vs/workbench/workbench.web.main.ts	2026-11-11 00:00:00.000000000 +0000
++++ src/vs/workbench/workbench.web.main.ts	2026-11-11 00:00:00.000000000
+@@ -138,6 +138,9 @@
+ //#region --- workbench contributions
+
++// PWA File Handling
++import './contrib/files/browser/webPwaFileHandling.js';
++
+ // Logs
+ import './contrib/logs/browser/logs.contribution.js';
