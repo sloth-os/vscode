@@ -19,10 +19,10 @@ Required for the static GitHub Pages deployment: without the shell there
 is nothing to consume the web configuration and create the workbench.
 
 diff --git a/build/next/index.ts b/build/next/index.ts
-index 1983fd1461c..4b91b409587 100644
+index dd534bff120..2f475668346 100644
 --- a/build/next/index.ts
 +++ b/build/next/index.ts
-@@ -124,6 +124,12 @@ const codeEntryPoints = [
+@@ -125,6 +125,12 @@ const codeEntryPoints = [
  const sessionsWebEntryPoint = 'vs/sessions/sessions.web.main.internal';
  const webOnlyEntryPoints = [
  	sessionsWebEntryPoint,
@@ -35,7 +35,7 @@ index 1983fd1461c..4b91b409587 100644
  ];
  
  const keyboardMapEntryPoints = [
-@@ -198,6 +204,10 @@ function getCssBundleEntryPointsForTarget(target: BuildTarget): Set<string> {
+@@ -205,6 +211,10 @@ function getCssBundleEntryPointsForTarget(target: BuildTarget): Set<string> {
  			return new Set([
  				'vs/workbench/workbench.web.main.internal',
  				'vs/sessions/sessions.web.main.internal',
@@ -44,5 +44,5 @@ index 1983fd1461c..4b91b409587 100644
 +				// workbench.html references.
 +				'vs/code/browser/workbench/workbench',
  			]);
- 		default:
- 			throw new Error(`Unknown target: ${target}`);
+ 		case 'mobile':
+ 			return new Set([mobileEntryPoint]);
